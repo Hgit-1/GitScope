@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="GitScope">
+  <rect width="512" height="512" fill="#080d0b"/>
+  <circle cx="256" cy="256" r="205" fill="#101a15"/>
+  <path d="M174 150v212M174 220c82 0 164-7 164-76M174 292c82 0 164 7 164 76" fill="none" stroke="#4ade80" stroke-width="30" stroke-linecap="round"/>
+  <circle cx="174" cy="150" r="35" fill="#4ade80" stroke="#101a15" stroke-width="16"/>
+  <circle cx="174" cy="362" r="35" fill="#4ade80" stroke="#101a15" stroke-width="16"/>
+  <circle cx="338" cy="144" r="35" fill="#38bdf8" stroke="#101a15" stroke-width="16"/>
+  <circle cx="338" cy="368" r="35" fill="#a78bfa" stroke="#101a15" stroke-width="16"/>
+</svg>

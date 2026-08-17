@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="GitScope">
+  <rect width="512" height="512" rx="112" fill="#080d0b"/>
+  <path d="M160 122v268M160 214c104 0 192-8 192-92M160 298c104 0 192 8 192 92" fill="none" stroke="#4ade80" stroke-width="36" stroke-linecap="round"/>
+  <circle cx="160" cy="122" r="45" fill="#4ade80" stroke="#080d0b" stroke-width="20"/>
+  <circle cx="160" cy="390" r="45" fill="#4ade80" stroke="#080d0b" stroke-width="20"/>
+  <circle cx="352" cy="122" r="45" fill="#38bdf8" stroke="#080d0b" stroke-width="20"/>
+  <circle cx="352" cy="390" r="45" fill="#a78bfa" stroke="#080d0b" stroke-width="20"/>
+</svg>

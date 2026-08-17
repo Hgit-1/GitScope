@@ -1,0 +1,24 @@
+{
+  "name": "gitscope",
+  "private": true,
+  "version": "0.6.1",
+  "workspaces": [
+    "apps/web",
+    "apps/api",
+    "packages/contracts"
+  ],
+  "scripts": {
+    "dev:web": "npm run dev -w @gitscope/web",
+    "dev:api": "npm run dev -w @gitscope/api",
+    "build": "npm run build -w @gitscope/contracts && npm run build -w @gitscope/web && npm run build -w @gitscope/api",
+    "build:pwa": "npm run build -w @gitscope/web",
+    "build:android": "bash scripts/mobile-toolchain.sh build",
+    "doctor:android": "bash scripts/mobile-toolchain.sh doctor",
+    "test:mobile": "bash scripts/mobile-toolchain.sh test",
+    "test": "npm run test -w @gitscope/api && npm run test -w @gitscope/web",
+    "test:all": "npm test && npm run test:mobile"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

@@ -1,0 +1,28 @@
+name: gitscope_mobile
+description: GitScope Android repository intelligence client.
+publish_to: none
+version: 0.6.1+17
+
+environment:
+  sdk: ">=3.5.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  dio: ^5.9.0
+  flutter_riverpod: ^2.6.1
+  flutter_secure_storage: ^9.2.4
+  go_router: ^16.2.1
+  google_fonts: ^6.3.1
+  image: ^4.5.4
+  image_picker: ^1.2.0
+  shared_preferences: ^2.5.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
