@@ -39,6 +39,13 @@ void main() {
     expect(await store.loadAnalysisMode(), AnalysisMode.remote);
   });
 
+  test('auto fetch interval defaults off and persists', () async {
+    final store = AppStore();
+    expect(await store.loadAutoFetchHours(), 0);
+    await store.saveAutoFetchHours(6);
+    expect(await store.loadAutoFetchHours(), 6);
+  });
+
   test('first-run permission introduction is shown only once', () async {
     final store = AppStore();
     expect(await store.hasSeenPermissionIntro(), isFalse);
@@ -60,18 +67,21 @@ void main() {
   test(
       'project storage retains the secure account reference for branch reloads',
       () async {
-    const project = SavedProject(
+    final updatedAt = DateTime.utc(2026, 8, 17, 10);
+    final project = SavedProject(
         id: 'project-id',
         owner: 'verified',
         name: 'repository',
         url: 'https://github.com/verified/repository',
         provider: GitProvider.github,
         accountId: '42',
-        isPrivate: true);
+        isPrivate: true,
+        lastFetchedAt: updatedAt);
     final store = AppStore();
     await store.saveProjects([project]);
     final loaded = await store.loadProjects();
     expect(loaded.single.accountId, '42');
     expect(loaded.single.isPrivate, isTrue);
+    expect(loaded.single.lastFetchedAt, updatedAt);
   });
 }

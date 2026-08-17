@@ -38,6 +38,7 @@ class AppStore {
   static const _themeKey = 'theme_v2';
   static const _apiBaseKey = 'api_base_v2';
   static const _analysisModeKey = 'analysis_mode_v3';
+  static const _autoFetchHoursKey = 'auto_fetch_hours_v1';
   static const _permissionIntroKey = 'permission_intro_v1';
 
   Future<List<AccountRef>> loadAccounts() async {
@@ -61,6 +62,7 @@ class AppStore {
 
   Future<List<SavedProject>> loadProjects() async {
     final preferences = await SharedPreferences.getInstance();
+    await preferences.reload();
     final raw = preferences.getString(_projectsKey);
     if (raw == null) return [];
     try {
@@ -118,6 +120,16 @@ class AppStore {
     await preferences.setString(_analysisModeKey, mode.name);
   }
 
+  Future<int> loadAutoFetchHours() async {
+    final preferences = await SharedPreferences.getInstance();
+    return preferences.getInt(_autoFetchHoursKey) ?? 0;
+  }
+
+  Future<void> saveAutoFetchHours(int hours) async {
+    final preferences = await SharedPreferences.getInstance();
+    await preferences.setInt(_autoFetchHoursKey, hours);
+  }
+
   Future<bool> hasSeenPermissionIntro() async {
     final preferences = await SharedPreferences.getInstance();
     return preferences.getBool(_permissionIntroKey) ?? false;
@@ -132,6 +144,22 @@ class AppStore {
     final preferences = await SharedPreferences.getInstance();
     await preferences.remove(_accountsKey);
     await preferences.remove(_projectsKey);
+  }
+}
+
+class AutoFetchService {
+  AutoFetchService({MethodChannel? channel})
+      : _channel =
+            channel ?? const MethodChannel('com.gitscope.mobile/local_git');
+  final MethodChannel _channel;
+
+  Future<void> configure(
+      {required int intervalHours,
+      required List<Map<String, Object?>> projects}) async {
+    await _channel.invokeMethod<void>('configureAutoFetch', {
+      'intervalHours': intervalHours,
+      'projects': projects,
+    });
   }
 }
 
@@ -432,9 +460,11 @@ class LocalGitAnalysisService implements RepositoryAnalysisService {
 
   Future<void> analyzeBranch(String projectId, String url, String branch,
       {String? accessToken, AnalysisProgress? onProgress}) async {
+    final overview = branch == branchOverviewName;
     final sessionId = _newSessionId();
     final subscription = _listenToAnalysisEvents(sessionId, onProgress);
-    onProgress?.call(.02, 'PREP · 正在准备分支 $branch');
+    onProgress?.call(
+        .02, overview ? 'PREP · 正在准备全部分支 Overview' : 'PREP · 正在准备分支 $branch');
     try {
       await _channel.invokeMethod<Object?>('analyzeBranch', {
         'projectId': projectId,
@@ -443,7 +473,8 @@ class LocalGitAnalysisService implements RepositoryAnalysisService {
         'sessionId': sessionId,
         if (accessToken != null) 'accessToken': accessToken,
       });
-      onProgress?.call(1, 'DONE · 分支图谱已更新');
+      onProgress?.call(
+          1, overview ? 'DONE · 分支 Overview 已更新' : 'DONE · 分支图谱已更新');
     } on PlatformException catch (error) {
       final status = await networkStatus();
       final suffix = status.vpnActive && error.code == 'GIT_CONNECTION'

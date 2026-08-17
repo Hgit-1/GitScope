@@ -285,6 +285,8 @@ dependencies {
     implementation(files(patchedJgitJar))
     implementation("com.googlecode.javaewah:JavaEWAH:1.1.13")
     implementation("org.slf4j:slf4j-nop:1.7.36")
+    implementation("androidx.work:work-runtime-ktx:2.10.1")
+    implementation("androidx.security:security-crypto:1.1.0")
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")

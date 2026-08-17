@@ -48,6 +48,18 @@ class MainActivity : FlutterActivity() {
             "mediaPermissionStatus" -> result.success(mediaPermissionStatus())
             "requestMediaPermission" -> requestMediaPermission(result)
             "openAppSettings" -> openAppSettings(result)
+            "configureAutoFetch" -> {
+                try {
+                    AutoFetchScheduler.configure(
+                        this,
+                        call.argument<Int>("intervalHours") ?: 0,
+                        call.argument<List<Map<String, Any?>>>("projects").orEmpty()
+                    )
+                    result.success(true)
+                } catch (error: Exception) {
+                    result.error("AUTO_FETCH_CONFIG", error.safeMessage(), null)
+                }
+            }
             "analyze", "analyzeBranch", "graph", "report", "deleteProject" -> executor.execute {
                 val sessionId = call.argument<String>("sessionId").orEmpty()
                 val logger = { progress: Double, stage: String, message: String ->

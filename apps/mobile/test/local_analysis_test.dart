@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:dio/dio.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:gitscope_mobile/models.dart';
 import 'package:gitscope_mobile/services.dart';
 
 void main() {
@@ -15,6 +16,7 @@ void main() {
   test('device-local service analyzes and reads native graph/report data',
       () async {
     final calls = <String>[];
+    final branchRequests = <Object?>[];
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (call) async {
       calls.add(call.method);
@@ -22,6 +24,8 @@ void main() {
         case 'analyze':
           return {'projectId': '11111111-1111-1111-1111-111111111111'};
         case 'analyzeBranch':
+          branchRequests
+              .add((call.arguments as Map<Object?, Object?>)['branch']);
           return {
             'projectId': '11111111-1111-1111-1111-111111111111',
             'branch': 'feature/mobile'
@@ -79,6 +83,8 @@ void main() {
     final id = await service.analyze('https://github.com/verified/repository');
     await service.analyzeBranch(
         id, 'https://github.com/verified/repository', 'feature/mobile');
+    await service.analyzeBranch(
+        id, 'https://github.com/verified/repository', branchOverviewName);
     final graph = await service.graph(id);
     final report = await service.report(id);
     await service.deleteProject(id);
@@ -89,8 +95,15 @@ void main() {
     expect(report.currentBranch, 'main');
     expect(report.currentBranchMetric?.commitCount, 1);
     expect(report.commitsByWeekday, hasLength(7));
-    expect(calls,
-        ['analyze', 'analyzeBranch', 'graph', 'report', 'deleteProject']);
+    expect(branchRequests, ['feature/mobile', branchOverviewName]);
+    expect(calls, [
+      'analyze',
+      'analyzeBranch',
+      'analyzeBranch',
+      'graph',
+      'report',
+      'deleteProject'
+    ]);
   });
 
   test('VPN connection failures return a specific local-analysis hint',
@@ -147,6 +160,27 @@ void main() {
 
     expect(progress, contains('CLONE · 正在接收对象 · 55%'));
     expect(progress.any((line) => line.contains('不应显示')), isFalse);
+  });
+
+  test('auto fetch configuration sends only the encrypted-native task payload',
+      () async {
+    Map<Object?, Object?>? arguments;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+      expect(call.method, 'configureAutoFetch');
+      arguments = call.arguments as Map<Object?, Object?>;
+      return true;
+    });
+    await AutoFetchService(channel: channel)
+        .configure(intervalHours: 6, projects: const [
+      {
+        'id': '11111111-1111-1111-1111-111111111111',
+        'url': 'https://github.com/verified/repository',
+        'accessToken': 'secret-test-token'
+      }
+    ]);
+    expect(arguments?['intervalHours'], 6);
+    expect(arguments?['projects'], hasLength(1));
   });
 
   test('remote 10.0.2.2 diagnostic identifies VPN route capture', () async {

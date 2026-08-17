@@ -88,6 +88,19 @@ class LocalGitAnalyzerTest {
                 )
                 assertEquals(branchName, analyzer.report(projectId)["currentBranch"])
             }
+            analyzer.analyzeBranch(
+                projectId,
+                "https://github.com/octocat/Hello-World.git",
+                "__gitscope_all_branches__",
+                null
+            )
+            val overviewReport = analyzer.report(projectId)
+            assertEquals("__gitscope_all_branches__", overviewReport["currentBranch"])
+            @Suppress("UNCHECKED_CAST")
+            val overviewBranches = overviewReport["branchDetails"] as List<Map<String, Any?>>
+            assertEquals(overviewReport["branches"], overviewBranches.size)
+            assertTrue(overviewBranches.all { it["isCurrent"] != true })
+            assertTrue((analyzer.graph(projectId, 0)["commits"] as List<*>).isNotEmpty())
             assertTrue(analyzer.deleteProject(projectId))
         } finally {
             root.deleteRecursively()
@@ -152,7 +165,9 @@ class LocalGitAnalyzerTest {
                 @Suppress("UNCHECKED_CAST")
                 val mergeParents = mergeCommit["parentIds"] as List<String>
                 val firstParent = commits.first { it["id"] == mergeParents.first() }
+                val featureCommit = commits.first { it["id"] == feature.name }
                 assertEquals(mergeCommit["lane"], firstParent["lane"])
+                assertTrue(featureCommit["lane"] != firstParent["lane"])
                 assertTrue(commits.maxOf { it["lane"] as Int } > 0)
                 @Suppress("UNCHECKED_CAST")
                 val report = data["report"] as Map<String, Any?>

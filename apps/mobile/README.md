@@ -1,6 +1,6 @@
 # GitScope Mobile
 
-GitScope 的 Flutter Android 客户端。应用可在设备内通过 JGit 浅克隆并分析 HTTPS Git 仓库，展示提交拓扑、分支关系、贡献报表、热点文件和临时克隆日志。
+GitScope 的 Flutter Android 客户端。应用可在设备内通过 JGit 浅克隆并分析 HTTPS Git 仓库，展示单分支或全部分支 Overview、提交拓扑、贡献报表、热点文件和临时克隆日志。项目支持手动 Fetch、相对更新时间及由 Android 系统调度的周期 Fetch。
 
 ## 开发验证
 

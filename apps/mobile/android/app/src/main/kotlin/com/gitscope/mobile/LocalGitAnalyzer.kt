@@ -139,12 +139,13 @@ class LocalGitAnalyzer(private val storageRoot: File) {
             stage = AnalysisStage.CLONE
             log(0.08, "REMOTE", "正在刷新远程分支目录")
             val catalog = listRemoteCatalog(uri, accessToken)
-            if (catalog.branches.none { it.name == branch }) {
+            val overview = branch == BRANCH_OVERVIEW
+            if (!overview && catalog.branches.none { it.name == branch }) {
                 throw LocalGitException("BRANCH_NOT_FOUND", "远程仓库中不存在分支 $branch")
             }
             val previous = readProject(projectId)
             val defaultBranch = previous.optString("_defaultBranch")
-                .ifBlank { catalog.branches.firstOrNull()?.name ?: branch }
+                .ifBlank { catalog.branches.firstOrNull()?.name ?: "HEAD" }
             val baseline = previous.optJSONArray("_defaultCommitIds")
                 ?.let(::jsonStringList).orEmpty()
             val knownLengths = previous.optJSONObject("_branchLengths")
@@ -152,18 +153,29 @@ class LocalGitAnalyzer(private val storageRoot: File) {
 
             prepareWorkspace(temporaryDirectory)
             log(0.18, "STORAGE", "临时工作区检查通过")
-            log(0.20, "CLONE", "开始浅克隆分支 $branch，历史深度 $STANDARD_CLONE_DEPTH")
+            log(
+                0.20,
+                "CLONE",
+                if (overview) {
+                    "开始浅克隆全部 ${catalog.branches.size} 个分支，单分支历史深度 $STANDARD_CLONE_DEPTH"
+                } else {
+                    "开始浅克隆分支 $branch，历史深度 $STANDARD_CLONE_DEPTH"
+                }
+            )
             val clone = Git.cloneRepository()
                 .setURI(uri.toASCIIString())
                 .setDirectory(temporaryDirectory)
                 .setBare(true)
-                .setCloneAllBranches(false)
-                .setBranchesToClone(listOf("refs/heads/$branch"))
-                .setBranch("refs/heads/$branch")
+                .setCloneAllBranches(overview)
                 .setNoTags()
                 .setDepth(STANDARD_CLONE_DEPTH)
                 .setTimeout(300)
                 .setProgressMonitor(limiter)
+            if (!overview) {
+                clone
+                    .setBranchesToClone(listOf("refs/heads/$branch"))
+                    .setBranch("refs/heads/$branch")
+            }
             if (supportsBloblessClone(uri.host)) {
                 log(0.21, "CLONE", "已启用无 Blob 传输，仅下载图谱所需的提交与目录对象")
                 clone.setTransportConfigCallback { transport ->
@@ -177,19 +189,28 @@ class LocalGitAnalyzer(private val storageRoot: File) {
             }
             clone.call().use { git ->
                 stage = AnalysisStage.ANALYZE
-                log(0.76, "ANALYZE", "正在生成 $branch 的单分支图谱")
-                val data = decorateBranchData(
-                    buildResult(git.repository),
-                    catalog,
-                    defaultBranch,
-                    branch,
-                    baseline,
-                    knownLengths
+                log(
+                    0.76,
+                    "ANALYZE",
+                    if (overview) "正在生成全部分支 Overview 图谱" else "正在生成 $branch 的单分支图谱"
                 )
+                val result = buildResult(git.repository)
+                val data = if (overview) {
+                    decorateOverviewData(result, catalog, defaultBranch, knownLengths)
+                } else {
+                    decorateBranchData(
+                        result,
+                        catalog,
+                        defaultBranch,
+                        branch,
+                        baseline,
+                        knownLengths
+                    )
+                }
                 stage = AnalysisStage.SAVE
-                log(0.94, "SAVE", "正在更新分支聚合结果")
+                log(0.94, "SAVE", if (overview) "正在保存全部分支图谱" else "正在更新分支聚合结果")
                 persist(projectId, data)
-                log(0.97, "SAVE", "分支图谱已保存")
+                log(0.97, "SAVE", if (overview) "分支 Overview 已保存" else "分支图谱已保存")
             }
             return mapOf("projectId" to projectId, "branch" to branch)
         } catch (error: InvalidRemoteException) {
@@ -522,6 +543,77 @@ class LocalGitAnalyzer(private val storageRoot: File) {
         )
     }
 
+    @Suppress("UNCHECKED_CAST")
+    private fun decorateOverviewData(
+        data: Map<String, Any>,
+        catalog: RemoteCatalog,
+        defaultBranch: String,
+        previousLengths: MutableMap<String, Any?>
+    ): Map<String, Any> {
+        val graph = data.getValue("graph") as Map<String, Any?>
+        val commits = graph.getValue("commits") as List<Map<String, Any?>>
+        val orderedIds = commits.mapNotNull { it["id"] as? String }
+        val parentsById = commits.associate { commit ->
+            val id = commit["id"] as String
+            id to (commit["parentIds"] as? List<String>).orEmpty()
+        }
+
+        fun reachableIds(tip: String): Set<String> {
+            val reachable = linkedSetOf<String>()
+            val pending = ArrayDeque<String>()
+            if (tip in parentsById) pending.add(tip)
+            while (pending.isNotEmpty()) {
+                val id = pending.removeLast()
+                if (!reachable.add(id)) continue
+                parentsById[id].orEmpty().forEach { parent ->
+                    if (parent in parentsById && parent !in reachable) pending.add(parent)
+                }
+            }
+            return reachable
+        }
+
+        val truncatedGraph = graph["truncated"] as? Boolean ?: false
+        val reachableByBranch = catalog.branches.associate { branch ->
+            branch.name to reachableIds(branch.tip)
+        }
+        catalog.branches.forEach { branch ->
+            val count = reachableByBranch.getValue(branch.name).size
+            previousLengths[branch.name] = mapOf(
+                "count" to count,
+                "truncated" to (truncatedGraph || count >= STANDARD_CLONE_DEPTH)
+            )
+        }
+        val defaultIds = orderedIds.filter {
+            it in reachableByBranch[defaultBranch].orEmpty()
+        }
+        val report = (data.getValue("report") as Map<String, Any?>).toMutableMap()
+        report["branches"] = catalog.branches.size
+        report["tags"] = catalog.tags
+        report["defaultBranch"] = defaultBranch
+        report["currentBranch"] = BRANCH_OVERVIEW
+        report["branchDetails"] = catalog.branches.map { branch ->
+            val length = previousLengths[branch.name] as? Map<*, *>
+            mapOf(
+                "name" to branch.name,
+                "tip" to branch.tip,
+                "isDefault" to (branch.name == defaultBranch),
+                "isCurrent" to false,
+                "commitCount" to length?.get("count"),
+                "truncated" to (length?.get("truncated") as? Boolean ?: false),
+                "ahead" to null,
+                "behind" to null,
+                "relation" to "overview"
+            )
+        }
+        return mapOf(
+            "graph" to graph,
+            "report" to report,
+            "_defaultBranch" to defaultBranch,
+            "_defaultCommitIds" to defaultIds,
+            "_branchLengths" to previousLengths
+        )
+    }
+
     private fun branchRelation(
         currentBranch: String,
         defaultBranch: String,
@@ -655,6 +747,7 @@ class LocalGitAnalyzer(private val storageRoot: File) {
         private const val HOTSPOT_COMMIT_LIMIT = 250
         private const val MIN_FREE_BYTES = 128L * 1024L * 1024L
         private const val STALE_WORKSPACE_MILLIS = 24L * 60L * 60L * 1000L
+        private const val BRANCH_OVERVIEW = "__gitscope_all_branches__"
         private val BLOBLESS_FILTER = FilterSpec.fromFilterLine("blob:none")
         private val PROJECT_ID = Regex("^[0-9a-fA-F-]{36}$")
     }

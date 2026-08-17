@@ -6,6 +6,8 @@ enum JobStatus { queued, validating, cloning, analyzing, completed, failed }
 
 enum AnalysisMode { local, remote }
 
+const branchOverviewName = '__gitscope_all_branches__';
+
 class AccountRef {
   const AccountRef(
       {required this.id,
@@ -47,7 +49,8 @@ class SavedProject {
       this.analysisMode = AnalysisMode.local,
       this.accountId,
       this.pinned = false,
-      this.isPrivate = false});
+      this.isPrivate = false,
+      this.lastFetchedAt});
   final String id;
   final String owner;
   final String name;
@@ -57,17 +60,20 @@ class SavedProject {
   final String? accountId;
   final bool pinned;
   final bool isPrivate;
+  final DateTime? lastFetchedAt;
 
-  SavedProject copyWith({bool? pinned}) => SavedProject(
-      id: id,
-      owner: owner,
-      name: name,
-      url: url,
-      provider: provider,
-      analysisMode: analysisMode,
-      accountId: accountId,
-      pinned: pinned ?? this.pinned,
-      isPrivate: isPrivate);
+  SavedProject copyWith({bool? pinned, DateTime? lastFetchedAt}) =>
+      SavedProject(
+          id: id,
+          owner: owner,
+          name: name,
+          url: url,
+          provider: provider,
+          analysisMode: analysisMode,
+          accountId: accountId,
+          pinned: pinned ?? this.pinned,
+          isPrivate: isPrivate,
+          lastFetchedAt: lastFetchedAt ?? this.lastFetchedAt);
 
   Map<String, dynamic> toJson() => {
         'id': id,
@@ -79,6 +85,7 @@ class SavedProject {
         'accountId': accountId,
         'pinned': pinned,
         'isPrivate': isPrivate,
+        'lastFetchedAt': lastFetchedAt?.toUtc().toIso8601String(),
       };
 
   factory SavedProject.fromJson(Map<String, dynamic> json) => SavedProject(
@@ -92,7 +99,10 @@ class SavedProject {
           .byName(json['analysisMode'] as String? ?? 'remote'),
       accountId: json['accountId'] as String?,
       pinned: json['pinned'] as bool? ?? false,
-      isPrivate: json['isPrivate'] as bool? ?? false);
+      isPrivate: json['isPrivate'] as bool? ?? false,
+      lastFetchedAt: json['lastFetchedAt'] == null
+          ? null
+          : DateTime.tryParse(json['lastFetchedAt'] as String));
 }
 
 class GraphPage {
@@ -175,6 +185,8 @@ class EngineeringReport {
   final String defaultBranch;
   final String currentBranch;
   final List<BranchMetric> branchDetails;
+
+  bool get isBranchOverview => currentBranch == branchOverviewName;
 
   BranchMetric? get currentBranchMetric {
     for (final branch in branchDetails) {

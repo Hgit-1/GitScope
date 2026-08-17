@@ -1,7 +1,7 @@
 name: gitscope_mobile
 description: GitScope Android repository intelligence client.
 publish_to: none
-version: 0.6.1+17
+version: 0.7.0+18
 
 environment:
   sdk: ">=3.5.0 <4.0.0"

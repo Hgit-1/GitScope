@@ -31,6 +31,7 @@ final analysisProvider = Provider<RepositoryAnalysisService>((ref) =>
         : ref.watch(remoteAnalysisProvider));
 final githubAccountProvider = Provider((ref) => GithubAccountService());
 final permissionServiceProvider = Provider((ref) => AppPermissionService());
+final autoFetchServiceProvider = Provider((ref) => AutoFetchService());
 final vaultProvider = Provider((ref) => const AccountVault(FlutterSecureStorage(
     aOptions: AndroidOptions(encryptedSharedPreferences: true))));
 final themeProvider = StateNotifierProvider<ThemeController, ThemeState>(
@@ -38,6 +39,22 @@ final themeProvider = StateNotifierProvider<ThemeController, ThemeState>(
 final projectProvider =
     StateNotifierProvider<ProjectController, List<SavedProject>>(
         (ref) => ProjectController(ref.read(appStoreProvider)));
+final projectGeneratedAtProvider =
+    FutureProvider.family<DateTime?, String>((ref, projectId) async {
+  final matching =
+      ref.read(projectProvider).where((project) => project.id == projectId);
+  if (matching.isEmpty || matching.first.analysisMode != AnalysisMode.local) {
+    return null;
+  }
+  try {
+    return (await ref.read(localAnalysisProvider).report(projectId))
+        .generatedAt;
+  } catch (_) {
+    return null;
+  }
+});
+final autoFetchHoursProvider = StateNotifierProvider<AutoFetchController, int>(
+    (ref) => AutoFetchController(ref.read(appStoreProvider)));
 final accountProvider =
     StateNotifierProvider<AccountController, List<AccountRef>>(
         (ref) => AccountController(ref.read(appStoreProvider)));
@@ -66,11 +83,84 @@ class AnalysisModeController extends StateNotifier<AnalysisMode> {
   }
 }
 
+class AutoFetchController extends StateNotifier<int> {
+  AutoFetchController(this.store) : super(0) {
+    _load();
+  }
+  final AppStore store;
+  Future<void> _load() async => state = await store.loadAutoFetchHours();
+  Future<void> setHours(int value) async {
+    state = value;
+    await store.saveAutoFetchHours(value);
+  }
+}
+
 RepositoryAnalysisService analysisServiceFor(
         WidgetRef ref, AnalysisMode mode) =>
     mode == AnalysisMode.local
         ? ref.read(localAnalysisProvider)
         : ref.read(remoteAnalysisProvider);
+
+String freshnessLabel(DateTime? value, {DateTime? now}) {
+  if (value == null) return '尚未更新';
+  final elapsed = (now ?? DateTime.now()).difference(value.toLocal());
+  if (elapsed.isNegative || elapsed.inMinutes < 1) return '刚刚更新';
+  if (elapsed.inHours < 1) return '${elapsed.inMinutes}分钟前';
+  if (elapsed.inDays < 1) return '${elapsed.inHours}小时前';
+  if (elapsed.inDays < 30) return '${elapsed.inDays}天前';
+  final months = math.max(1, elapsed.inDays ~/ 30);
+  return months == 1 ? '一月前' : '$months月前';
+}
+
+Future<String?> projectAccessToken(WidgetRef ref, SavedProject project) async {
+  if (project.isPrivate && project.accountId == null) {
+    throw Exception('该私有项目未记录安全账号引用，请重新导入后再 Fetch');
+  }
+  if (project.accountId == null) return null;
+  final token = await ref.read(vaultProvider).accessToken(project.accountId!);
+  if (token == null) throw Exception('所选账号需要重新验证，请前往账号库连接');
+  return token;
+}
+
+Future<void> syncAutoFetch(WidgetRef ref, {int? intervalHours}) async {
+  final int hours = intervalHours ?? ref.read(autoFetchHoursProvider);
+  final configs = <Map<String, Object?>>[];
+  if (hours > 0) {
+    for (final project in ref.read(projectProvider)) {
+      if (project.analysisMode != AnalysisMode.local) continue;
+      String? accessToken;
+      try {
+        accessToken = await projectAccessToken(ref, project);
+      } catch (_) {
+        // Projects whose account was removed remain in the library, but must
+        // not keep stale credentials in the native background schedule.
+        continue;
+      }
+      configs.add({
+        'id': project.id,
+        'url': project.url,
+        if (accessToken != null) 'accessToken': accessToken,
+      });
+    }
+  }
+  await ref
+      .read(autoFetchServiceProvider)
+      .configure(intervalHours: hours, projects: configs);
+}
+
+Future<void> fetchSavedProject(WidgetRef ref, SavedProject project) async {
+  if (project.analysisMode != AnalysisMode.local) {
+    throw Exception('现有项目的 Fetch 仅支持设备内标准模式');
+  }
+  final service = ref.read(localAnalysisProvider);
+  final current = await service.report(project.id);
+  final branch = current.currentBranch.isEmpty
+      ? current.defaultBranch
+      : current.currentBranch;
+  await service.analyzeBranch(project.id, project.url, branch,
+      accessToken: await projectAccessToken(ref, project));
+  ref.read(projectProvider.notifier).markFetched(project.id, DateTime.now());
+}
 
 class ThemeState {
   const ThemeState(
@@ -161,6 +251,7 @@ class ProjectController extends StateNotifier<List<SavedProject>> {
   }
   final AppStore store;
   Future<void> _load() async => state = await store.loadProjects();
+  Future<void> reload() => _load();
   void add(SavedProject project) {
     state = [project, ...state.where((item) => item.id != project.id)];
     store.saveProjects(state);
@@ -170,6 +261,14 @@ class ProjectController extends StateNotifier<List<SavedProject>> {
     state = [
       for (final item in state)
         item.id == id ? item.copyWith(pinned: !item.pinned) : item
+    ];
+    store.saveProjects(state);
+  }
+
+  void markFetched(String id, DateTime value) {
+    state = [
+      for (final item in state)
+        item.id == id ? item.copyWith(lastFetchedAt: value) : item
     ];
     store.saveProjects(state);
   }
@@ -376,7 +475,8 @@ class MainScreen extends ConsumerStatefulWidget {
   ConsumerState<MainScreen> createState() => _MainScreenState();
 }
 
-class _MainScreenState extends ConsumerState<MainScreen> {
+class _MainScreenState extends ConsumerState<MainScreen>
+    with WidgetsBindingObserver {
   var index = 0;
   final pages = const [
     ImportPage(),
@@ -388,8 +488,22 @@ class _MainScreenState extends ConsumerState<MainScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     WidgetsBinding.instance
         .addPostFrameCallback((_) => _requestInitialPermissions());
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      ref.read(projectProvider.notifier).reload();
+    }
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
   }
 
   Future<void> _requestInitialPermissions() async {
@@ -760,8 +874,12 @@ class _ImportPageState extends ConsumerState<ImportPage> {
                       : GitProvider.generic,
           analysisMode: mode,
           accountId: selectedAccountId == 'public' ? null : selectedAccountId,
-          isPrivate: selectedAccountId != 'public');
+          isPrivate: selectedAccountId != 'public',
+          lastFetchedAt: DateTime.now());
       ref.read(projectProvider.notifier).add(project);
+      if (ref.read(autoFetchHoursProvider) > 0) {
+        await syncAutoFetch(ref);
+      }
       if (mounted) context.push('/project/${project.id}');
     } catch (exception) {
       if (mounted) {
@@ -1033,42 +1151,72 @@ class ProjectTile extends ConsumerWidget {
   const ProjectTile({super.key, required this.project});
   final SavedProject project;
   @override
-  Widget build(BuildContext context, WidgetRef ref) => Card(
-      elevation: 0,
-      child: ListTile(
-          minTileHeight: 76,
-          leading: const CircleAvatar(child: Icon(Icons.code)),
-          title: Text('${project.owner} / ${project.name}', maxLines: 2),
-          subtitle: Text(project.isPrivate ? '私有仓库 · 最近分析' : '公开仓库 · 最近分析'),
-          trailing: PopupMenuButton<String>(
-              tooltip: '项目操作',
-              onSelected: (action) async {
-                if (action == 'pin') {
-                  ref.read(projectProvider.notifier).togglePin(project.id);
-                } else if (action == 'delete') {
-                  ref.read(projectProvider.notifier).remove(project.id);
-                  await analysisServiceFor(ref, project.analysisMode)
-                      .deleteProject(project.id)
-                      .catchError((_) {});
-                }
-              },
-              itemBuilder: (context) => [
-                    PopupMenuItem(
-                        value: 'pin',
-                        child: ListTile(
-                            contentPadding: EdgeInsets.zero,
-                            leading: Icon(project.pinned
-                                ? Icons.push_pin
-                                : Icons.push_pin_outlined),
-                            title: Text(project.pinned ? '取消置顶' : '置顶'))),
-                    const PopupMenuItem(
-                        value: 'delete',
-                        child: ListTile(
-                            contentPadding: EdgeInsets.zero,
-                            leading: Icon(Icons.delete_outline),
-                            title: Text('删除项目历史')))
-                  ]),
-          onTap: () => context.push('/project/${project.id}')));
+  Widget build(BuildContext context, WidgetRef ref) {
+    final reportTime = project.lastFetchedAt == null
+        ? ref
+            .watch(projectGeneratedAtProvider(project.id))
+            .whenOrNull(data: (value) => value)
+        : null;
+    return Card(
+        elevation: 0,
+        child: ListTile(
+            minTileHeight: 76,
+            leading: const CircleAvatar(child: Icon(Icons.code)),
+            title: Text('${project.owner} / ${project.name}', maxLines: 2),
+            subtitle: Text(
+                '${project.isPrivate ? '私有仓库' : '公开仓库'} · ${freshnessLabel(project.lastFetchedAt ?? reportTime)}'),
+            trailing: PopupMenuButton<String>(
+                tooltip: '项目操作',
+                onSelected: (action) async {
+                  if (action == 'pin') {
+                    ref.read(projectProvider.notifier).togglePin(project.id);
+                  } else if (action == 'fetch') {
+                    try {
+                      await fetchSavedProject(ref, project);
+                      if (context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text('Fetch 完成，项目数据已更新')));
+                      }
+                    } catch (exception) {
+                      if (context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                            content: Text(exception
+                                .toString()
+                                .replaceFirst('Exception: ', ''))));
+                      }
+                    }
+                  } else if (action == 'delete') {
+                    ref.read(projectProvider.notifier).remove(project.id);
+                    await analysisServiceFor(ref, project.analysisMode)
+                        .deleteProject(project.id)
+                        .catchError((_) {});
+                    await syncAutoFetch(ref).catchError((_) {});
+                  }
+                },
+                itemBuilder: (context) => [
+                      PopupMenuItem(
+                          value: 'pin',
+                          child: ListTile(
+                              contentPadding: EdgeInsets.zero,
+                              leading: Icon(project.pinned
+                                  ? Icons.push_pin
+                                  : Icons.push_pin_outlined),
+                              title: Text(project.pinned ? '取消置顶' : '置顶'))),
+                      const PopupMenuItem(
+                          value: 'fetch',
+                          child: ListTile(
+                              contentPadding: EdgeInsets.zero,
+                              leading: Icon(Icons.sync),
+                              title: Text('Fetch 更新'))),
+                      const PopupMenuItem(
+                          value: 'delete',
+                          child: ListTile(
+                              contentPadding: EdgeInsets.zero,
+                              leading: Icon(Icons.delete_outline),
+                              title: Text('删除项目历史')))
+                    ]),
+            onTap: () => context.push('/project/${project.id}')));
+  }
 }
 
 class ProjectsPage extends ConsumerStatefulWidget {
@@ -1176,6 +1324,9 @@ class AccountsPage extends ConsumerWidget {
                       } else if (action == 'remove') {
                         await ref.read(vaultProvider).remove(account.id);
                         ref.read(accountProvider.notifier).remove(account.id);
+                        if (ref.read(autoFetchHoursProvider) > 0) {
+                          await syncAutoFetch(ref).catchError((_) {});
+                        }
                       }
                     },
                     itemBuilder: (context) => [
@@ -1234,6 +1385,9 @@ class _AccountConnectSheetState extends ConsumerState<AccountConnectSheet> {
       final account = await ref.read(githubAccountProvider).verifyToken(value);
       await ref.read(vaultProvider).saveTokens(account.id, accessToken: value);
       ref.read(accountProvider.notifier).add(account);
+      if (ref.read(autoFetchHoursProvider) > 0) {
+        await syncAutoFetch(ref).catchError((_) {});
+      }
       if (mounted) Navigator.pop(context);
     } catch (exception) {
       if (mounted) {
@@ -1293,6 +1447,7 @@ class SettingsPage extends ConsumerWidget {
     final state = ref.watch(themeProvider);
     final apiBase = ref.watch(apiBaseProvider);
     final analysisMode = ref.watch(analysisModeProvider);
+    final autoFetchHours = ref.watch(autoFetchHoursProvider);
     return PageContent(children: [
       const Eyebrow('PREFERENCES'),
       const SizedBox(height: 12),
@@ -1339,6 +1494,20 @@ class SettingsPage extends ConsumerWidget {
       Card(
           child: ListTile(
               minTileHeight: 76,
+              leading: const Icon(Icons.schedule_send_outlined),
+              title: const Text('自动 Fetch'),
+              subtitle: Text(autoFetchHours == 0
+                  ? '已关闭'
+                  : '约每 ${autoFetchHours == 24 ? '天' : autoFetchHours == 168 ? '周' : '$autoFetchHours 小时'}自动更新'),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () => showModalBottomSheet<void>(
+                  context: context,
+                  isScrollControlled: true,
+                  showDragHandle: true,
+                  builder: (context) => const AutoFetchSheet()))),
+      Card(
+          child: ListTile(
+              minTileHeight: 76,
               leading: const Icon(Icons.admin_panel_settings_outlined),
               title: const Text('应用权限'),
               subtitle: const Text('照片访问、网络与私有存储'),
@@ -1380,6 +1549,8 @@ class SettingsPage extends ConsumerWidget {
                 await ref.read(appStoreProvider).clearUserData();
                 ref.read(accountProvider.notifier).clear();
                 ref.read(projectProvider.notifier).clear();
+                await ref.read(autoFetchHoursProvider.notifier).setHours(0);
+                await syncAutoFetch(ref, intervalHours: 0).catchError((_) {});
                 if (context.mounted) {
                   ScaffoldMessenger.of(context)
                       .showSnackBar(const SnackBar(content: Text('本地用户数据已清除')));
@@ -1425,10 +1596,104 @@ class SettingsPage extends ConsumerWidget {
                               ])))))),
       const SizedBox(height: 28),
       Center(
-          child: Text('GitScope 0.6.1',
+          child: Text('GitScope 0.7.0',
               style: GoogleFonts.jetBrainsMono(fontSize: 11)))
     ]);
   }
+}
+
+class AutoFetchSheet extends ConsumerStatefulWidget {
+  const AutoFetchSheet({super.key});
+
+  @override
+  ConsumerState<AutoFetchSheet> createState() => _AutoFetchSheetState();
+}
+
+class _AutoFetchSheetState extends ConsumerState<AutoFetchSheet> {
+  late int selected = ref.read(autoFetchHoursProvider);
+  bool saving = false;
+  String? error;
+
+  static const options = <(int, String, String)>[
+    (0, '关闭自动 Fetch', '仅在手动点击 Fetch 时更新'),
+    (1, '每小时', '适合活跃开发仓库'),
+    (6, '每 6 小时', '平衡时效与电量'),
+    (24, '每天', '适合一般项目'),
+    (168, '每周', '适合归档或低频项目'),
+  ];
+
+  Future<void> save() async {
+    setState(() {
+      saving = true;
+      error = null;
+    });
+    try {
+      await ref.read(autoFetchHoursProvider.notifier).setHours(selected);
+      await syncAutoFetch(ref, intervalHours: selected);
+      if (mounted) Navigator.pop(context);
+    } catch (exception) {
+      if (mounted) {
+        setState(() {
+          saving = false;
+          error = exception.toString().replaceFirst('Exception: ', '');
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => SafeArea(
+      child: SingleChildScrollView(
+          padding: const EdgeInsets.fromLTRB(20, 0, 20, 28),
+          child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text('自动 Fetch',
+                    style: Theme.of(context)
+                        .textTheme
+                        .headlineSmall
+                        ?.copyWith(fontWeight: FontWeight.w700)),
+                const SizedBox(height: 6),
+                Text('Android 会在联网且电量允许时批量更新设备内项目。执行时间由系统调度，可能晚于设定周期。',
+                    style: TextStyle(
+                        color: Theme.of(context).colorScheme.onSurfaceVariant)),
+                const SizedBox(height: 12),
+                RadioGroup<int>(
+                    groupValue: selected,
+                    onChanged: saving
+                        ? (_) {}
+                        : (value) => setState(() => selected = value ?? 0),
+                    child: Column(
+                        children: options
+                            .map((option) => RadioListTile<int>(
+                                key: ValueKey('auto-fetch-${option.$1}'),
+                                contentPadding: EdgeInsets.zero,
+                                value: option.$1,
+                                title: Text(option.$2),
+                                subtitle: Text(option.$3)))
+                            .toList())),
+                const SizedBox(height: 4),
+                Text('HarmonyOS 可能因电池优化延后后台任务；如需更及时，请允许 GitScope 后台活动。',
+                    style: TextStyle(
+                        fontSize: 12,
+                        color: Theme.of(context).colorScheme.onSurfaceVariant)),
+                if (error != null) ...[
+                  const SizedBox(height: 10),
+                  Text(error!,
+                      style:
+                          TextStyle(color: Theme.of(context).colorScheme.error))
+                ],
+                const SizedBox(height: 18),
+                FilledButton.icon(
+                    onPressed: saving ? null : save,
+                    icon: saving
+                        ? const SizedBox.square(
+                            dimension: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2))
+                        : const Icon(Icons.schedule),
+                    label: const Text('保存自动任务'))
+              ])));
 }
 
 class ApiServerSheet extends ConsumerStatefulWidget {
@@ -1762,6 +2027,27 @@ class _ProjectScreenState extends ConsumerState<ProjectScreen>
     }
   }
 
+  Future<void> fetchProject(SavedProject project) async {
+    if (switchingBranch) return;
+    setState(() => switchingBranch = true);
+    try {
+      await fetchSavedProject(ref, project);
+      await load(showLoading: false);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Fetch 完成，已重新生成当前图谱与报表')));
+      }
+    } catch (exception) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+            content:
+                Text(exception.toString().replaceFirst('Exception: ', ''))));
+      }
+    } finally {
+      if (mounted) setState(() => switchingBranch = false);
+    }
+  }
+
   @override
   void dispose() {
     tabs.dispose();
@@ -1792,9 +2078,15 @@ class _ProjectScreenState extends ConsumerState<ProjectScreen>
             ]),
             actions: [
               IconButton(
-                  tooltip: '重新加载项目数据',
-                  onPressed: loading ? null : load,
-                  icon: const Icon(Icons.refresh))
+                  tooltip: 'Fetch 远程更新',
+                  onPressed: loading || switchingBranch
+                      ? null
+                      : () => fetchProject(project),
+                  icon: switchingBranch
+                      ? const SizedBox.square(
+                          dimension: 19,
+                          child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Icon(Icons.sync))
             ],
             bottom: TabBar(controller: tabs, tabs: const [
               Tab(icon: Icon(Icons.account_tree_outlined), text: '图谱'),
@@ -1856,11 +2148,15 @@ class GitGraphView extends StatefulWidget {
 
 class _GitGraphViewState extends State<GitGraphView> {
   final searchController = TextEditingController();
+  final scrollController = ScrollController();
+  final commitKeys = <String, GlobalKey>{};
   String searchQuery = '';
+  String? selectedSearchCommitId;
 
   @override
   void dispose() {
     searchController.dispose();
+    scrollController.dispose();
     super.dispose();
   }
 
@@ -1872,12 +2168,38 @@ class _GitGraphViewState extends State<GitGraphView> {
         ...commit.refs
       ].any((value) => value.toLowerCase().contains(query));
 
-  void showCommitDetails(BuildContext context, CommitNode commit) {
+  Future<void> copyCommitValue(
+      BuildContext context, String label, String value) async {
+    await Clipboard.setData(ClipboardData(text: value));
+    if (context.mounted) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('$label 已复制')));
+    }
+  }
+
+  Future<void> jumpToCommit(CommitNode commit) async {
+    FocusManager.instance.primaryFocus?.unfocus();
+    setState(() => selectedSearchCommitId = commit.fullId);
+    await WidgetsBinding.instance.endOfFrame;
+    var target = commitKeys[commit.fullId]?.currentContext;
+    if (target == null && scrollController.hasClients) {
+      scrollController.jumpTo(scrollController.position.maxScrollExtent);
+      await WidgetsBinding.instance.endOfFrame;
+      target = commitKeys[commit.fullId]?.currentContext;
+    }
+    if (target == null || !mounted || !target.mounted) return;
+    await Scrollable.ensureVisible(target,
+        duration: const Duration(milliseconds: 420),
+        curve: Curves.easeOutCubic,
+        alignment: .18);
+  }
+
+  void showCommitDetails(BuildContext pageContext, CommitNode commit) {
     showModalBottomSheet<void>(
-        context: context,
+        context: pageContext,
         showDragHandle: true,
         isScrollControlled: true,
-        builder: (context) => SafeArea(
+        builder: (sheetContext) => SafeArea(
             child: Padding(
                 padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
                 child: Column(
@@ -1889,31 +2211,44 @@ class _GitGraphViewState extends State<GitGraphView> {
                             commit.parentIds.length > 1
                                 ? Icons.merge
                                 : Icons.commit,
-                            color: Theme.of(context).colorScheme.primary),
+                            color: Theme.of(sheetContext).colorScheme.primary),
                         const SizedBox(width: 10),
                         Expanded(
                             child: Text(
                                 commit.parentIds.length > 1
                                     ? 'Merge commit · ${commit.parentIds.length} 个父提交'
                                     : 'Commit 详情',
-                                style: Theme.of(context)
+                                style: Theme.of(sheetContext)
                                     .textTheme
                                     .titleMedium
                                     ?.copyWith(fontWeight: FontWeight.w700)))
                       ]),
                       const SizedBox(height: 16),
-                      SelectableText(commit.fullId,
-                          style: GoogleFonts.jetBrainsMono(
-                              fontSize: 12,
-                              color: Theme.of(context).colorScheme.primary)),
-                      const SizedBox(height: 12),
-                      Text(commit.message,
-                          style: const TextStyle(
-                              fontSize: 16, fontWeight: FontWeight.w700)),
+                      ListTile(
+                          key: const ValueKey('copy-commit-hash'),
+                          contentPadding: EdgeInsets.zero,
+                          leading: const Icon(Icons.tag),
+                          title: const Text('Commit Hash'),
+                          subtitle: Text(commit.fullId,
+                              style: GoogleFonts.jetBrainsMono(fontSize: 12)),
+                          trailing: const Icon(Icons.copy, size: 19),
+                          onTap: () => copyCommitValue(
+                              pageContext, 'Commit Hash', commit.fullId)),
+                      ListTile(
+                          key: const ValueKey('copy-commit-name'),
+                          contentPadding: EdgeInsets.zero,
+                          leading: const Icon(Icons.subject),
+                          title: const Text('Commit 名称'),
+                          subtitle: Text(commit.message,
+                              style: const TextStyle(
+                                  fontSize: 15, fontWeight: FontWeight.w700)),
+                          trailing: const Icon(Icons.copy, size: 19),
+                          onTap: () => copyCommitValue(
+                              pageContext, 'Commit 名称', commit.message)),
                       const SizedBox(height: 8),
                       Text('${commit.author} · ${commit.date.toLocal()}',
                           style: TextStyle(
-                              color: Theme.of(context)
+                              color: Theme.of(sheetContext)
                                   .colorScheme
                                   .onSurfaceVariant)),
                       if (commit.refs.isNotEmpty) ...[
@@ -1958,170 +2293,218 @@ class _GitGraphViewState extends State<GitGraphView> {
         widget.commits.fold<int>(
                 0, (maximum, commit) => math.max(maximum, commit.lane)) +
             1);
-    return ListView(padding: const EdgeInsets.all(16), children: [
-      if (report != null) ...[
-        BranchSelectorCard(
-            report: report,
-            loading: widget.switchingBranch,
-            onSelected: widget.onBranchSelected),
-        const SizedBox(height: 12),
-      ],
-      SearchBar(
-          controller: searchController,
-          leading: const Icon(Icons.search),
-          hintText: '搜索提交内容、作者、哈希或分支',
-          constraints: const BoxConstraints(minHeight: 52),
-          trailing: [
-            if (searchQuery.isNotEmpty)
-              IconButton(
-                  tooltip: '清除搜索',
-                  onPressed: () {
-                    searchController.clear();
-                    setState(() => searchQuery = '');
-                  },
-                  icon: const Icon(Icons.close))
-          ],
-          onChanged: (value) => setState(() => searchQuery = value)),
-      if (normalizedQuery.isNotEmpty) ...[
-        const SizedBox(height: 10),
-        AppCard(
-            child:
-                Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Row(children: [
-            const Icon(Icons.manage_search, size: 19),
-            const SizedBox(width: 8),
-            Expanded(
-                child: Text(
-                    '${matchingCommits.length} 个提交 · ${matchingBranches.length} 个分支',
-                    style: const TextStyle(fontWeight: FontWeight.w700)))
-          ]),
-          if (matchingBranches.isNotEmpty) ...[
-            const SizedBox(height: 10),
-            Wrap(
-                spacing: 8,
-                runSpacing: 8,
-                children: matchingBranches
-                    .take(8)
-                    .map((branch) => ActionChip(
-                        avatar: Icon(
-                            branch.isCurrent
-                                ? Icons.check_circle
-                                : Icons.call_split,
-                            size: 17),
-                        label: Text(branch.name),
-                        onPressed: widget.switchingBranch || branch.isCurrent
-                            ? null
-                            : () => widget.onBranchSelected(branch.name)))
-                    .toList())
-          ],
-          if (matchingCommits.isNotEmpty) ...[
-            const SizedBox(height: 8),
-            ...matchingCommits.take(8).map((commit) => ListTile(
-                key: ValueKey('search-${commit.fullId}'),
-                minTileHeight: 52,
-                contentPadding: EdgeInsets.zero,
-                leading: Icon(
-                    commit.parentIds.length > 1 ? Icons.merge : Icons.commit),
-                title: Text(commit.message,
-                    maxLines: 1, overflow: TextOverflow.ellipsis),
-                subtitle: Text('${commit.id} · ${commit.author}',
-                    maxLines: 1, overflow: TextOverflow.ellipsis),
-                onTap: () => showCommitDetails(context, commit))),
-            if (matchingCommits.length > 8)
-              Text('另有 ${matchingCommits.length - 8} 个匹配提交，请输入更多关键词缩小范围。',
-                  style: TextStyle(
-                      fontSize: 12,
-                      color: Theme.of(context).colorScheme.onSurfaceVariant))
-          ],
-          if (matchingCommits.isEmpty && matchingBranches.isEmpty) ...[
+    return ListView(
+        controller: scrollController,
+        padding: const EdgeInsets.all(16),
+        children: [
+          if (report != null) ...[
+            BranchSelectorCard(
+                report: report,
+                loading: widget.switchingBranch,
+                onSelected: widget.onBranchSelected),
             const SizedBox(height: 12),
-            Text('当前已加载历史中没有匹配结果。',
-                style: TextStyle(
-                    color: Theme.of(context).colorScheme.onSurfaceVariant))
-          ]
-        ])),
-      ],
-      const SizedBox(height: 14),
-      const Eyebrow('COMMIT EVOLUTION'),
-      const SizedBox(height: 5),
-      Text('$branchLengthLabel commits · $laneCount lanes',
-          style: GoogleFonts.jetBrainsMono(
-              fontSize: 11,
-              color: Theme.of(context).colorScheme.onSurfaceVariant)),
-      const SizedBox(height: 12),
-      AppCard(child: LayoutBuilder(builder: (context, constraints) {
-        final graphWidth =
-            math.min(constraints.maxWidth * .42, 52.0 + (laneCount - 1) * 18.0);
-        return SizedBox(
-            height: widget.commits.length * 74,
-            child: Stack(children: [
-              Positioned.fill(
-                  child: CustomPaint(
-                      painter: GraphPainter(widget.commits,
-                          Theme.of(context).colorScheme, graphWidth))),
-              ...widget.commits.indexed.map((entry) {
-                final index = entry.$1;
-                final commit = entry.$2;
-                return Positioned(
-                    top: index * 74.0,
-                    left: graphWidth + 8,
-                    right: 0,
-                    height: 70,
-                    child: InkWell(
-                        borderRadius: BorderRadius.circular(10),
-                        onTap: () => showCommitDetails(context, commit),
-                        child: Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 8),
-                            child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                mainAxisAlignment: MainAxisAlignment.center,
-                                children: [
-                                  Text(commit.message,
-                                      maxLines: 2,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: const TextStyle(
-                                          fontSize: 12,
-                                          fontWeight: FontWeight.w600)),
-                                  const SizedBox(height: 4),
-                                  Text('${commit.id} · ${commit.author}',
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: GoogleFonts.jetBrainsMono(
-                                          fontSize: 11,
-                                          color: Theme.of(context)
-                                              .colorScheme
-                                              .onSurfaceVariant)),
-                                  if (commit.parentIds.length > 1 ||
-                                      commit.refs.isNotEmpty)
-                                    Row(children: [
-                                      if (commit.parentIds.length > 1) ...[
-                                        Icon(Icons.merge,
-                                            size: 12,
-                                            color: Theme.of(context)
-                                                .colorScheme
-                                                .tertiary),
-                                        const SizedBox(width: 3),
-                                      ],
-                                      Expanded(
-                                          child: Text(
-                                              [
-                                                if (commit.parentIds.length > 1)
-                                                  'MERGE · ${commit.parentIds.length} parents',
-                                                ...commit.refs
-                                              ].join(' · '),
+          ],
+          SearchBar(
+              controller: searchController,
+              leading: const Icon(Icons.search),
+              hintText: '搜索提交内容、作者、哈希或分支',
+              constraints: const BoxConstraints(minHeight: 52),
+              trailing: [
+                if (searchQuery.isNotEmpty)
+                  IconButton(
+                      tooltip: '清除搜索',
+                      onPressed: () {
+                        searchController.clear();
+                        setState(() {
+                          searchQuery = '';
+                          selectedSearchCommitId = null;
+                        });
+                      },
+                      icon: const Icon(Icons.close))
+              ],
+              onChanged: (value) => setState(() => searchQuery = value)),
+          if (normalizedQuery.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            AppCard(
+                child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                  Row(children: [
+                    const Icon(Icons.manage_search, size: 19),
+                    const SizedBox(width: 8),
+                    Expanded(
+                        child: Text(
+                            '${matchingCommits.length} 个提交 · ${matchingBranches.length} 个分支',
+                            style:
+                                const TextStyle(fontWeight: FontWeight.w700)))
+                  ]),
+                  if (matchingBranches.isNotEmpty) ...[
+                    const SizedBox(height: 10),
+                    Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: matchingBranches
+                            .take(8)
+                            .map((branch) => ActionChip(
+                                avatar: Icon(
+                                    branch.isCurrent
+                                        ? Icons.check_circle
+                                        : Icons.call_split,
+                                    size: 17),
+                                label: Text(branch.name),
+                                onPressed: widget.switchingBranch ||
+                                        branch.isCurrent
+                                    ? null
+                                    : () =>
+                                        widget.onBranchSelected(branch.name)))
+                            .toList())
+                  ],
+                  if (matchingCommits.isNotEmpty) ...[
+                    const SizedBox(height: 8),
+                    ...matchingCommits.take(8).map((commit) => ListTile(
+                        key: ValueKey('search-${commit.fullId}'),
+                        minTileHeight: 52,
+                        contentPadding: EdgeInsets.zero,
+                        leading: Icon(commit.parentIds.length > 1
+                            ? Icons.merge
+                            : Icons.commit),
+                        title: Text(commit.message,
+                            maxLines: 1, overflow: TextOverflow.ellipsis),
+                        subtitle: Text('${commit.id} · ${commit.author}',
+                            maxLines: 1, overflow: TextOverflow.ellipsis),
+                        selected: selectedSearchCommitId == commit.fullId,
+                        onTap: () => setState(
+                            () => selectedSearchCommitId = commit.fullId))),
+                    if (matchingCommits.length > 8)
+                      Text(
+                          '另有 ${matchingCommits.length - 8} 个匹配提交，请输入更多关键词缩小范围。',
+                          style: TextStyle(
+                              fontSize: 12,
+                              color: Theme.of(context)
+                                  .colorScheme
+                                  .onSurfaceVariant)),
+                    if (selectedSearchCommitId != null &&
+                        matchingCommits.any((commit) =>
+                            commit.fullId == selectedSearchCommitId)) ...[
+                      const SizedBox(height: 10),
+                      FilledButton.icon(
+                          key: const ValueKey('jump-to-search-commit'),
+                          onPressed: () => jumpToCommit(
+                              matchingCommits.firstWhere((commit) =>
+                                  commit.fullId == selectedSearchCommitId)),
+                          icon: const Icon(Icons.south),
+                          label: const Text('跳转到该提交'))
+                    ]
+                  ],
+                  if (matchingCommits.isEmpty && matchingBranches.isEmpty) ...[
+                    const SizedBox(height: 12),
+                    Text('当前已加载历史中没有匹配结果。',
+                        style: TextStyle(
+                            color:
+                                Theme.of(context).colorScheme.onSurfaceVariant))
+                  ]
+                ])),
+          ],
+          const SizedBox(height: 14),
+          const Eyebrow('COMMIT EVOLUTION'),
+          const SizedBox(height: 5),
+          Text('$branchLengthLabel commits · $laneCount lanes',
+              style: GoogleFonts.jetBrainsMono(
+                  fontSize: 11,
+                  color: Theme.of(context).colorScheme.onSurfaceVariant)),
+          const SizedBox(height: 12),
+          AppCard(child: LayoutBuilder(builder: (context, constraints) {
+            final graphWidth = math.min(
+                constraints.maxWidth * .42, 52.0 + (laneCount - 1) * 18.0);
+            return SizedBox(
+                height: widget.commits.length * 74,
+                child: Stack(children: [
+                  Positioned.fill(
+                      child: CustomPaint(
+                          painter: GraphPainter(widget.commits,
+                              Theme.of(context).colorScheme, graphWidth))),
+                  ...widget.commits.indexed.map((entry) {
+                    final index = entry.$1;
+                    final commit = entry.$2;
+                    return Positioned(
+                        top: index * 74.0,
+                        left: graphWidth + 8,
+                        right: 0,
+                        height: 70,
+                        child: Material(
+                            key: commitKeys.putIfAbsent(
+                                commit.fullId, () => GlobalKey()),
+                            color: selectedSearchCommitId == commit.fullId
+                                ? Theme.of(context)
+                                    .colorScheme
+                                    .primaryContainer
+                                    .withValues(alpha: .72)
+                                : Colors.transparent,
+                            borderRadius: BorderRadius.circular(10),
+                            child: InkWell(
+                                borderRadius: BorderRadius.circular(10),
+                                onTap: () => showCommitDetails(context, commit),
+                                child: Padding(
+                                    padding: const EdgeInsets.symmetric(
+                                        horizontal: 8),
+                                    child: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        mainAxisAlignment:
+                                            MainAxisAlignment.center,
+                                        children: [
+                                          Text(commit.message,
+                                              maxLines: 2,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: const TextStyle(
+                                                  fontSize: 12,
+                                                  fontWeight: FontWeight.w600)),
+                                          const SizedBox(height: 4),
+                                          Text(
+                                              '${commit.id} · ${commit.author}',
                                               maxLines: 1,
                                               overflow: TextOverflow.ellipsis,
-                                              style: TextStyle(
-                                                  fontSize: 10,
+                                              style: GoogleFonts.jetBrainsMono(
+                                                  fontSize: 11,
                                                   color: Theme.of(context)
                                                       .colorScheme
-                                                      .primary)))
-                                    ])
-                                ]))));
-              })
-            ]));
-      })),
-    ]);
+                                                      .onSurfaceVariant)),
+                                          if (commit.parentIds.length > 1 ||
+                                              commit.refs.isNotEmpty)
+                                            Row(children: [
+                                              if (commit.parentIds.length >
+                                                  1) ...[
+                                                Icon(Icons.merge,
+                                                    size: 12,
+                                                    color: Theme.of(context)
+                                                        .colorScheme
+                                                        .tertiary),
+                                                const SizedBox(width: 3),
+                                              ],
+                                              Expanded(
+                                                  child: Text(
+                                                      [
+                                                        if (commit.parentIds
+                                                                .length >
+                                                            1)
+                                                          'MERGE · ${commit.parentIds.length} parents',
+                                                        ...commit.refs
+                                                      ].join(' · '),
+                                                      maxLines: 1,
+                                                      overflow:
+                                                          TextOverflow.ellipsis,
+                                                      style: TextStyle(
+                                                          fontSize: 10,
+                                                          color:
+                                                              Theme.of(context)
+                                                                  .colorScheme
+                                                                  .primary)))
+                                            ])
+                                        ])))));
+                  })
+                ]));
+          })),
+        ]);
   }
 }
 
@@ -2152,9 +2535,9 @@ class BranchSelectorCard extends StatelessWidget {
         Icon(Icons.account_tree_outlined,
             color: Theme.of(context).colorScheme.primary),
         const SizedBox(width: 10),
-        const Expanded(
-            child:
-                Text('单分支图谱', style: TextStyle(fontWeight: FontWeight.w700))),
+        Expanded(
+            child: Text(report.isBranchOverview ? '全部分支图谱' : '单分支图谱',
+                style: const TextStyle(fontWeight: FontWeight.w700))),
         if (loading)
           const SizedBox.square(
               dimension: 18, child: CircularProgressIndicator(strokeWidth: 2))
@@ -2165,8 +2548,10 @@ class BranchSelectorCard extends StatelessWidget {
               labelText: '当前分支', prefixIcon: Icon(Icons.call_split_outlined)),
           child: DropdownButtonHideUnderline(
               child: DropdownButton<String>(
-                  value:
-                      branches.any((item) => item.name == report.currentBranch)
+                  value: report.isBranchOverview
+                      ? branchOverviewName
+                      : branches
+                              .any((item) => item.name == report.currentBranch)
                           ? report.currentBranch
                           : null,
                   isExpanded: true,
@@ -2178,26 +2563,85 @@ class BranchSelectorCard extends StatelessWidget {
                             onSelected(value);
                           }
                         },
-                  items: branches
-                      .map((branch) => DropdownMenuItem(
-                          value: branch.name,
-                          child: Text(
-                              branch.commitCount == null
-                                  ? branch.name
-                                  : '${branch.name} · ${branch.truncated ? '≥' : ''}${branch.commitCount}',
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis)))
-                      .toList()))),
+                  items: [
+                DropdownMenuItem(
+                    value: branchOverviewName,
+                    child: Row(children: [
+                      const Icon(Icons.hub_outlined, size: 19),
+                      const SizedBox(width: 9),
+                      Expanded(
+                          child: Text('分支 Overview · 全部 ${branches.length} 个',
+                              maxLines: 1, overflow: TextOverflow.ellipsis))
+                    ])),
+                ...branches.map((branch) => DropdownMenuItem(
+                    value: branch.name,
+                    child: Text(
+                        branch.commitCount == null
+                            ? branch.name
+                            : '${branch.name} · ${branch.truncated ? '≥' : ''}${branch.commitCount}',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis)))
+              ]))),
       const SizedBox(height: 12),
       Wrap(spacing: 8, runSpacing: 8, children: [
         DataBadge(
             icon: Icons.commit,
-            label: current?.commitCount == null
-                ? '长度待分析'
-                : '长度 ${current!.truncated ? '≥' : ''}${current.commitCount}'),
+            label: report.isBranchOverview
+                ? '唯一提交 ${report.totalCommits}'
+                : current?.commitCount == null
+                    ? '长度待分析'
+                    : '长度 ${current!.truncated ? '≥' : ''}${current.commitCount}'),
         DataBadge(icon: Icons.width_normal, label: '分支宽度 ${report.branches}'),
-        DataBadge(icon: Icons.compare_arrows, label: relationLabel(current))
-      ])
+        DataBadge(
+            icon: report.isBranchOverview
+                ? Icons.hub_outlined
+                : Icons.compare_arrows,
+            label: report.isBranchOverview ? '全部远程分支' : relationLabel(current))
+      ]),
+      const SizedBox(height: 8),
+      Theme(
+          data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+          child: ExpansionTile(
+              key: ValueKey('branch-overview-${report.currentBranch}'),
+              tilePadding: EdgeInsets.zero,
+              childrenPadding: EdgeInsets.zero,
+              initiallyExpanded: report.isBranchOverview,
+              leading: const Icon(Icons.schema_outlined),
+              title: const Text('分支 Overview',
+                  style: TextStyle(fontWeight: FontWeight.w700)),
+              subtitle: Text('${branches.length} 个远程分支 · 展开查看全部'),
+              children: branches
+                  .map((branch) => Padding(
+                      key: ValueKey('branch-overview-${branch.name}'),
+                      padding: const EdgeInsets.only(bottom: 6),
+                      child: Material(
+                          type: MaterialType.card,
+                          clipBehavior: Clip.antiAlias,
+                          color: branch.isCurrent
+                              ? Theme.of(context)
+                                  .colorScheme
+                                  .primaryContainer
+                                  .withValues(alpha: .7)
+                              : Theme.of(context)
+                                  .colorScheme
+                                  .surfaceContainerHighest
+                                  .withValues(alpha: .55),
+                          borderRadius: BorderRadius.circular(12),
+                          child: ListTile(
+                              minTileHeight: 56,
+                              contentPadding:
+                                  const EdgeInsets.symmetric(horizontal: 10),
+                              leading: Icon(branch.isCurrent ? Icons.check_circle : Icons.call_split,
+                                  color: branch.isCurrent
+                                      ? Theme.of(context).colorScheme.primary
+                                      : null),
+                              title: Text(branch.name,
+                                  maxLines: 1, overflow: TextOverflow.ellipsis),
+                              subtitle: Text('${branch.tip.isEmpty ? '无远程 Tip' : branch.tip.substring(0, math.min(7, branch.tip.length))} · ${branch.commitCount == null ? '尚未加载长度' : '${branch.truncated ? '≥' : ''}${branch.commitCount} commits'}', maxLines: 1, overflow: TextOverflow.ellipsis),
+                              trailing: branch.isDefault ? const Chip(label: Text('默认')) : const Icon(Icons.chevron_right),
+                              enabled: !loading,
+                              onTap: branch.isCurrent || loading ? null : () => onSelected(branch.name)))))
+                  .toList()))
     ]));
   }
 }
@@ -2224,20 +2668,29 @@ class DataBadge extends StatelessWidget {
       ]));
 }
 
-List<Offset> graphEdgePoints(Offset start, Offset end) {
+enum GraphEdgeAnchor { parent, child }
+
+List<Offset> graphEdgePoints(Offset start, Offset end,
+    {GraphEdgeAnchor anchor = GraphEdgeAnchor.parent}) {
   if ((start.dx - end.dx).abs() < .01) return [start, end];
   final verticalDirection = end.dy >= start.dy ? 1.0 : -1.0;
   final availableHeight = (end.dy - start.dy).abs();
   final diagonalHeight = (end.dx - start.dx).abs();
   if (availableHeight <= diagonalHeight) return [start, end];
-  // Every lane change uses the same 1:1 diagonal. Any remaining distance is
-  // vertical on the parent lane, so a long time/topology gap cannot look like
-  // a slow, unrelated merge curve.
-  return [
-    start,
-    Offset(end.dx, start.dy + verticalDirection * diagonalHeight),
-    end
-  ];
+  // Every lane change uses the same 1:1 diagonal. A branch edge remains
+  // straight on its new lane and joins exactly at the parent node; a merge
+  // edge does the inverse and joins exactly at the merge commit node.
+  return anchor == GraphEdgeAnchor.parent
+      ? [
+          start,
+          Offset(start.dx, end.dy - verticalDirection * diagonalHeight),
+          end
+        ]
+      : [
+          start,
+          Offset(end.dx, start.dy + verticalDirection * diagonalHeight),
+          end
+        ];
 }
 
 class GraphPainter extends CustomPainter {
@@ -2300,7 +2753,10 @@ class GraphPainter extends CustomPainter {
           ..strokeWidth = laneCount > 12
               ? (parentOrder == 0 ? 1.8 : 1.35)
               : (parentOrder == 0 ? 2.7 : 2.0);
-        final points = graphEdgePoints(start, end);
+        final points = graphEdgePoints(start, end,
+            anchor: commit.parentIds.length > 1
+                ? GraphEdgeAnchor.child
+                : GraphEdgeAnchor.parent);
         final path = Path()..moveTo(points.first.dx, points.first.dy);
         for (final point in points.skip(1)) {
           path.lineTo(point.dx, point.dy);

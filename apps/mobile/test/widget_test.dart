@@ -1,6 +1,7 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:gitscope_mobile/main.dart';
 import 'package:gitscope_mobile/models.dart';
@@ -193,6 +194,30 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets('auto fetch schedule offers system-friendly intervals',
+      (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    tester.view.physicalSize = const Size(375, 667);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+    await tester.pumpWidget(const ProviderScope(child: GitScopeApp()));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('设置').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('自动 Fetch'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('每小时'), findsOneWidget);
+    expect(find.text('每 6 小时'), findsOneWidget);
+    expect(find.text('每天'), findsOneWidget);
+    expect(find.text('每周'), findsOneWidget);
+    expect(find.textContaining('HarmonyOS'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('permission center explains and requests only media access',
       (tester) async {
     SharedPreferences.setMockInitialValues({});
@@ -282,6 +307,73 @@ void main() {
     expect(tester.takeException(), isNull);
   });
 
+  testWidgets('branch overview exposes every remote branch on a compact phone',
+      (tester) async {
+    tester.view.physicalSize = const Size(375, 667);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+    String? selected;
+    final report = EngineeringReport(
+        totalCommits: 38,
+        branches: 3,
+        tags: 2,
+        contributors: const [],
+        commitsByWeekday: const [4, 5, 6, 7, 8, 4, 4],
+        hotspots: const [],
+        generatedAt: DateTime.utc(2026, 8, 17),
+        defaultBranch: 'main',
+        currentBranch: branchOverviewName,
+        branchDetails: const [
+          BranchMetric(
+              name: 'main',
+              tip: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+              isDefault: true,
+              isCurrent: false,
+              relation: 'overview',
+              commitCount: 30),
+          BranchMetric(
+              name: 'feature/mobile',
+              tip: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+              isDefault: false,
+              isCurrent: false,
+              relation: 'overview',
+              commitCount: 12),
+          BranchMetric(
+              name: 'release/0.7',
+              tip: 'cccccccccccccccccccccccccccccccccccccccc',
+              isDefault: false,
+              isCurrent: false,
+              relation: 'overview',
+              commitCount: 21)
+        ]);
+    await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+            body: SingleChildScrollView(
+                child: BranchSelectorCard(
+                    report: report,
+                    loading: false,
+                    onSelected: (value) => selected = value)))));
+    await tester.pumpAndSettle();
+
+    expect(find.text('全部分支图谱'), findsOneWidget);
+    expect(find.text('分支 Overview · 全部 3 个'), findsOneWidget);
+    expect(find.text('唯一提交 38'), findsOneWidget);
+    expect(find.text('全部远程分支'), findsOneWidget);
+    for (final branch in ['main', 'feature/mobile', 'release/0.7']) {
+      expect(find.byKey(ValueKey('branch-overview-$branch')), findsOneWidget);
+    }
+    expect(find.text('默认'), findsOneWidget);
+
+    await tester
+        .tap(find.byKey(const ValueKey('branch-overview-feature/mobile')));
+    await tester.pump();
+    expect(selected, 'feature/mobile');
+    expect(tester.takeException(), isNull);
+  });
+
   testWidgets('temporary clone log remains readable while a task is running',
       (tester) async {
     tester.view.physicalSize = const Size(375, 667);
@@ -309,13 +401,35 @@ void main() {
 
   test('graph edges keep a fixed diagonal across long parent gaps', () {
     final points = graphEdgePoints(const Offset(12, 20), const Offset(42, 240));
-    expect(points, const [Offset(12, 20), Offset(42, 50), Offset(42, 240)]);
-    final diagonal = points[1] - points[0];
+    expect(points, const [Offset(12, 20), Offset(12, 210), Offset(42, 240)]);
+    expect(points[1].dx, points.first.dx,
+        reason: 'a diverged branch stays straight on its new lane');
+    final diagonal = points[2] - points[1];
     expect(diagonal.dx.abs(), diagonal.dy.abs());
+
+    final mergePoints = graphEdgePoints(
+        const Offset(12, 20), const Offset(42, 240),
+        anchor: GraphEdgeAnchor.child);
+    expect(
+        mergePoints, const [Offset(12, 20), Offset(42, 50), Offset(42, 240)]);
+    expect(mergePoints[1].dy, 50,
+        reason: 'a merge changes lanes directly at its merge node');
   });
 
   testWidgets('commit search finds content and branch names on a phone',
       (tester) async {
+    String? copiedText;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(SystemChannels.platform, (call) async {
+      if (call.method == 'Clipboard.setData') {
+        copiedText =
+            (call.arguments as Map<Object?, Object?>)['text'] as String?;
+      }
+      return null;
+    });
+    addTearDown(() => TestDefaultBinaryMessengerBinding
+        .instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(SystemChannels.platform, null));
     tester.view.physicalSize = const Size(375, 667);
     tester.view.devicePixelRatio = 1;
     addTearDown(() {
@@ -390,7 +504,39 @@ void main() {
     expect(branchChip, findsOneWidget);
     await tester.tap(branchChip);
     expect(selectedBranch, 'feature/mobile');
+
+    await tester.tap(find.byKey(
+        const ValueKey('search-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb')));
+    await tester.pump();
+    expect(find.byKey(const ValueKey('jump-to-search-commit')), findsOneWidget);
+    final jumpButton = find.byKey(const ValueKey('jump-to-search-commit'));
+    await tester.ensureVisible(jumpButton);
+    await tester.pumpAndSettle();
+    await tester.tap(jumpButton);
+    await tester.pumpAndSettle();
     expect(find.textContaining('MERGE · 2 parents'), findsOneWidget);
+
+    await tester.tap(find.text('Fix feature search').last);
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('copy-commit-hash')), findsOneWidget);
+    tester
+        .widget<ListTile>(find.byKey(const ValueKey('copy-commit-hash')))
+        .onTap!();
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 250));
+    expect(copiedText, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb');
     expect(tester.takeException(), isNull);
+  });
+
+  test('project freshness uses concise Chinese relative times', () {
+    final now = DateTime(2026, 8, 17, 12);
+    expect(freshnessLabel(now.subtract(const Duration(seconds: 20)), now: now),
+        '刚刚更新');
+    expect(freshnessLabel(now.subtract(const Duration(hours: 1)), now: now),
+        '1小时前');
+    expect(
+        freshnessLabel(now.subtract(const Duration(days: 1)), now: now), '1天前');
+    expect(freshnessLabel(now.subtract(const Duration(days: 31)), now: now),
+        '一月前');
   });
 }
