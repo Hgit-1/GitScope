@@ -11,3 +11,10 @@
 - Release 构建禁止明文 HTTP；Debug/Profile 仍允许模拟器本地调试。
 
 GitHub APK 为开发签名的预发布测试包，不用于应用商店分发。
+
+验证信息：
+
+- Android 版本：`0.6.1 (17)`
+- APK Signature Scheme v2：通过
+- Release 明文流量：已禁用
+- SHA-256：`6a6f2f81aadaf62700cddff50482973fa2487be6f10d691cac1e0cbb9e5c6244`
